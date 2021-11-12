@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// see cufftType in cufft.h
+enum FTType {
+    R2C = 0;
+    C2R = 1;
+    C2C_FORWARD = 2;
+    C2C_INVERSE = 3;
+    D2Z = 4;
+    Z2D = 5;
+    Z2Z_FORWARD = 6;
+    Z2Z_INVERSE = 7;
+}
+
+message FTRequest {
+    bytes Values = 1;
+    FTType Type = 2;
+    repeated uint32 Size = 3;
+    uint32 Tasks = 4;
+}
+
+message FTResponse {
+    bytes Values = 1;
+}
+
+service FTService {
+    rpc Exec(FTRequest) returns (FTResponse);
+}
