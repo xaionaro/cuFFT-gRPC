@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"unsafe"
 
+	"github.com/edsrzf/mmap-go"
 	pb "github.com/xaionaro/cuFFT-gRPC/client_example/go/protobufgen/github.com/xaionaro/cuFFT-gRPC/protobuf"
 	"google.golang.org/grpc"
 )
@@ -63,26 +65,42 @@ func main() {
 	defer cancelFn()
 
 	client := pb.NewFTServiceClient(conn)
-	response, err := client.Exec(ctx, &pb.FTRequest{
-		Values: castFloat64SliceToBytes([]float64{1, 2, 1, 3, 1, 1, 0, 1, 0.5, 0}),
-		Type:   pb.FTType_D2Z,
-		Size:   []uint32{10},
-		Tasks:  1,
+
+	f, err := os.CreateTemp("/dev/shm", "cufft-grpc-buffer-")
+	assertNoError(err)
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	err = f.Truncate(96)
+	assertNoError(err)
+
+	buf, err := mmap.Map(f, mmap.RDWR, 0)
+	assertNoError(err)
+	defer buf.Unmap()
+
+	data := []float64{1, 2, 1, 3, 1, 1, 0, 1, 0.5, 0}
+	copy(buf, castFloat64SliceToBytes(data))
+
+	_, err = client.Exec(ctx, &pb.FTRequest{
+		DataFilePath: f.Name(),
+		Type:         pb.FTType_D2Z,
+		Sizes:        []uint32{10},
+		Tasks:        1,
 	})
 	assertNoError(err)
 
-	result := castBytesToComplex128Slice(response.Values)
+	result := castBytesToComplex128Slice(buf)
 	fmt.Println(result)
 
-	response, err = client.Exec(ctx, &pb.FTRequest{
-		Values: castComplex128SliceToBytes(result),
-		Type:   pb.FTType_Z2D,
-		Size:   []uint32{10},
-		Tasks:  1,
+	_, err = client.Exec(ctx, &pb.FTRequest{
+		DataFilePath: f.Name(),
+		Type:         pb.FTType_Z2D,
+		Sizes:        []uint32{10},
+		Tasks:        1,
 	})
 	assertNoError(err)
 
-	reversed := castBytesToFloat64Slice(response.Values)
+	reversed := castBytesToFloat64Slice(buf[:80])
 	for idx := range reversed {
 		reversed[idx] /= float64(len(reversed))
 	}

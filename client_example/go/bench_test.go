@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"testing"
 
 	"github.com/cpmech/gosl/fun/fftw"
+	"github.com/edsrzf/mmap-go"
 	pb "github.com/xaionaro/cuFFT-gRPC/client_example/go/protobufgen/github.com/xaionaro/cuFFT-gRPC/protobuf"
 	"google.golang.org/grpc"
 )
@@ -26,19 +28,31 @@ func newCuFFTThroughGRPCHandler() *cuFFTThroughGRPCHandler {
 }
 
 func (h *cuFFTThroughGRPCHandler) Batch(inputs [][]complex128, isInverse bool) {
-	batch := make([]complex128, len(inputs[0])*len(inputs))
+	f, err := os.CreateTemp("/dev/shm", "cufft-grpc-buffer-")
+	assertNoError(err)
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	err = f.Truncate(int64(len(inputs[0]) * len(inputs) * 16))
+	assertNoError(err)
+
+	buf, err := mmap.Map(f, mmap.RDWR, 0)
+	assertNoError(err)
+	defer buf.Unmap()
+
 	for idx, in := range inputs {
-		copy(batch[idx*len(in):], in)
+		_in := castComplex128SliceToBytes(in)
+		copy(buf[idx*len(_in):], _in)
 	}
 	taskType := pb.FTType_Z2Z_FORWARD
 	if isInverse {
 		taskType = pb.FTType_Z2Z_INVERSE
 	}
-	_, err := h.FTServiceClient.Exec(context.Background(), &pb.FTRequest{
-		Values: castComplex128SliceToBytes(batch),
-		Type:   taskType,
-		Size:   []uint32{uint32(len(inputs[0]))},
-		Tasks:  uint32(len(inputs)),
+	_, err = h.FTServiceClient.Exec(context.Background(), &pb.FTRequest{
+		DataFilePath: f.Name(),
+		Type:         taskType,
+		Sizes:        []uint32{uint32(len(inputs[0]))},
+		Tasks:        uint32(len(inputs)),
 	})
 	assertNoError(err)
 }
@@ -80,7 +94,7 @@ func prepareBatch(batchSize, taskSize uint) [][]complex128 {
 }
 
 func benchmark(b *testing.B, fftHandler fttHandlerInterface) {
-	for _, batchSize := range []uint{1, 10, 100} {
+	for _, batchSize := range []uint{1, 10, 100, 1000, 10000} {
 		b.Run(fmt.Sprintf("batchSize%d", batchSize), func(b *testing.B) {
 			for _, taskSize := range []uint{2, 10, 100, 1000, 10000, 100000} {
 				b.Run(fmt.Sprintf("taskSize%d", taskSize), func(b *testing.B) {

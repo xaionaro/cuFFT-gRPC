@@ -14,14 +14,13 @@ enum FTType {
 }
 
 message FTRequest {
-    bytes Values = 1;
+    string DataFilePath = 1;
     FTType Type = 2;
-    repeated uint32 Size = 3;
+    repeated uint32 Sizes = 3;
     uint32 Tasks = 4;
 }
 
 message FTResponse {
-    bytes Values = 1;
 }
 
 service FTService {

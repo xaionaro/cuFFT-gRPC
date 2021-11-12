@@ -1,5 +1,12 @@
 
 #include <assert.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
 #include <complex>
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -150,13 +157,11 @@ inline unsigned int calc_output_memsize(
 }
 
 
-inline bool validate_input(
+inline unsigned int calc_input_memsize(
     const unsigned int batch_size,
     const unsigned int dims,
     const int* const _sizes,
-    const cufftType task_type,
-    const int direction,
-    const unsigned int input_memsize
+    const cufftType task_type
 ) {
     int *sizes;
     switch (task_type) {
@@ -164,11 +169,11 @@ inline bool validate_input(
     case cufftType::CUFFT_Z2D: {
         if (dims < 1 || dims > 3) {
             LOG(WARNING) << "invalid amount of dimensions";
-            return NULL;
+            return -1;
         }
         if (dims > 1) {
             LOG(WARNING) << "not supported, yet";
-            return NULL;
+            return -1;
         }
         int size = _sizes[0]/2+1;
         sizes = &size;
@@ -185,12 +190,7 @@ inline bool validate_input(
     }
 
     const unsigned int item_size = item_size_input(task_type);
-    const unsigned int input_memsize_expected = calc_memsize(batch_size, dims, sizes, item_size);
-    if (input_memsize != input_memsize_expected) {
-        LOG(WARNING) << "invalid input memsize: " << input_memsize << " != " << input_memsize_expected << " (" << batch_size << " x dims x " << item_size << ")";
-        return false;
-    }
-    return true;
+    return calc_memsize(batch_size, dims, sizes, item_size);
 }
 
 class ServiceImpl final : public FTService::Service {
@@ -203,25 +203,44 @@ public:
         cufftType task_type = task_type_from_protobuf(request->type());
         int direction = ft_direction(request->type());
         const unsigned int batch_size = request->tasks();
-        const void *input = request->values().data();
-        const unsigned int input_memsize = request->values().length();
-
-        int dims = request->size_size();
+        int exchange_fd = open(request->datafilepath().c_str(), O_RDWR);
+        if (exchange_fd < 0) {
+            LOG(WARNING) << "unable to open file " << request->datafilepath();
+            close(exchange_fd);
+            return ::grpc::Status::CANCELLED;
+        }
+        struct stat exchange_fstats;
+        int stat_rc = fstat(exchange_fd, &exchange_fstats);
+        if (stat_rc != 0) {
+            LOG(WARNING) << "unable to fstat() file " << request->datafilepath();
+            close(exchange_fd);
+            return ::grpc::Status::CANCELLED;
+        }
+        const unsigned int exchange_memsize = exchange_fstats.st_size;
+        void *exchange_buffer = mmap(0, exchange_memsize, PROT_WRITE, MAP_SHARED, exchange_fd, 0);
+        if (exchange_buffer == MAP_FAILED) {
+            LOG(WARNING) << "unable to mmap() file " << request->datafilepath() << ": " << strerror(errno);
+            close(exchange_fd);
+            return ::grpc::Status::CANCELLED;
+        }
+        int dims = request->sizes_size();
         int *sizes = (int *)malloc(dims * sizeof(int));
         {
-            auto _sizes = request->size().data();
+            auto _sizes = request->sizes().data();
             for (int dim = 0; dim < dims; dim++) {
                 sizes[dim] = _sizes[dim];
             }
         }
-
-        if (!validate_input(batch_size, dims, sizes, task_type, direction, input_memsize)) {
+        const unsigned int input_memsize = calc_input_memsize(batch_size, dims, sizes, task_type);
+        if (input_memsize < 0) {
+            munmap(exchange_buffer, exchange_memsize);
+            close(exchange_fd);
             return ::grpc::Status::CANCELLED;
         }
 
         void *d_input;
         CUDA_CHECK(cudaMalloc(&d_input, input_memsize));
-        CUDA_CHECK(cudaMemcpy(d_input, input, input_memsize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_input, exchange_buffer, input_memsize, cudaMemcpyHostToDevice));
 
         void *d_output;
         const unsigned int output_memsize = calc_output_memsize(batch_size, dims, sizes, task_type);
@@ -260,16 +279,16 @@ public:
         }
         cudaDeviceSynchronize();
 
-        void *output = (void *)malloc(output_memsize);
-        CUDA_CHECK(cudaMemcpy(output, d_output, output_memsize, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(exchange_buffer, d_output, output_memsize, cudaMemcpyDeviceToHost));
         cufftDestroy(plan);
         CUDA_CHECK(cudaFree(d_input));
         if (d_output != d_input) {
             CUDA_CHECK(cudaFree(d_output));
         }
+        free(sizes);
 
-        std::string *output_string = new std::string((char *)output, output_memsize);
-        response->set_allocated_values(output_string);
+        munmap(exchange_buffer, exchange_memsize);
+        close(exchange_fd);
         return ::grpc::Status::OK;
     };
 };
