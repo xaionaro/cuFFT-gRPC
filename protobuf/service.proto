@@ -1,4 +1,5 @@
 syntax = "proto3";
+option go_package = "github.com/xaionaro/cuFFT-gRPC/protobuf";
 
 // see cufftType in cufft.h
 enum FTType {

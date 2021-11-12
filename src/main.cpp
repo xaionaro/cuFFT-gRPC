@@ -74,6 +74,125 @@ int ft_direction(const FTType t) {
     assert(false); // should never happen
 }
 
+inline unsigned int item_size_output(
+    const cufftType task_type
+) {
+    switch(task_type) {
+    case cufftType::CUFFT_C2R:
+        return 4;
+    case cufftType::CUFFT_Z2D:
+    case cufftType::CUFFT_C2C:
+    case cufftType::CUFFT_R2C:
+        return 8;
+    case cufftType::CUFFT_Z2Z:
+    case cufftType::CUFFT_D2Z:
+        return 16;
+    default:
+        assert(false); // should never happen
+    }
+}
+
+inline unsigned int item_size_input(
+    const cufftType task_type
+) {
+    switch(task_type) {
+    case cufftType::CUFFT_R2C:
+        return 4;
+    case cufftType::CUFFT_D2Z:
+    case cufftType::CUFFT_C2R:
+    case cufftType::CUFFT_C2C:
+        return 8;
+    case cufftType::CUFFT_Z2D:
+    case cufftType::CUFFT_Z2Z:
+        return 16;
+    default:
+        assert(false); // should never happen
+    }
+}
+
+inline unsigned int calc_memsize(
+    const unsigned int batch_size,
+    const unsigned int dims,
+    const int* const sizes,
+    const unsigned int item_size
+) {
+    unsigned int result = batch_size * item_size;
+    for (int dim = 0; dim < dims; dim++) {
+        result *= sizes[dim];
+    }
+    return result;
+}
+
+inline unsigned int calc_output_memsize(
+    const unsigned int batch_size,
+    const unsigned int dims,
+    const int* const sizes,
+    const cufftType task_type
+) {
+    switch(task_type) {
+    case cufftType::CUFFT_R2C:
+    case cufftType::CUFFT_D2Z: {
+        if (dims > 1) {
+            LOG(WARNING) << "not supported, yet";
+            return false;
+        }
+        const int size = sizes[0]/2+1;
+        return calc_memsize(batch_size, dims, &size, item_size_output(task_type));
+    }
+    case cufftType::CUFFT_C2R:
+    case cufftType::CUFFT_C2C:
+    case cufftType::CUFFT_Z2D:
+    case cufftType::CUFFT_Z2Z:
+        return calc_memsize(batch_size, dims, sizes, item_size_output(task_type));
+    default:
+        assert(false); // should never happen
+    }
+}
+
+
+inline bool validate_input(
+    const unsigned int batch_size,
+    const unsigned int dims,
+    const int* const _sizes,
+    const cufftType task_type,
+    const int direction,
+    const unsigned int input_memsize
+) {
+    int *sizes;
+    switch (task_type) {
+    case cufftType::CUFFT_C2R:
+    case cufftType::CUFFT_Z2D: {
+        if (dims < 1 || dims > 3) {
+            LOG(WARNING) << "invalid amount of dimensions";
+            return NULL;
+        }
+        if (dims > 1) {
+            LOG(WARNING) << "not supported, yet";
+            return NULL;
+        }
+        int size = _sizes[0]/2+1;
+        sizes = &size;
+        break;
+    }
+    case cufftType::CUFFT_R2C:
+    case cufftType::CUFFT_D2Z:
+    case cufftType::CUFFT_C2C:
+    case cufftType::CUFFT_Z2Z:
+        sizes = (int *)_sizes;
+        break;
+    default:
+        assert(false); // should never happen
+    }
+
+    const unsigned int item_size = item_size_input(task_type);
+    const unsigned int input_memsize_expected = calc_memsize(batch_size, dims, sizes, item_size);
+    if (input_memsize != input_memsize_expected) {
+        LOG(WARNING) << "invalid input memsize: " << input_memsize << " != " << input_memsize_expected << " (" << batch_size << " x dims x " << item_size << ")";
+        return false;
+    }
+    return true;
+}
+
 class ServiceImpl final : public FTService::Service {
 public:
     ::grpc::Status Exec(
@@ -81,33 +200,11 @@ public:
         const ::FTRequest* request,
         ::FTResponse* response
     ) override {
-        cufftType taskType = task_type_from_protobuf(request->type());
+        cufftType task_type = task_type_from_protobuf(request->type());
+        int direction = ft_direction(request->type());
         const unsigned int batch_size = request->tasks();
         const void *input = request->values().data();
         const unsigned int input_memsize = request->values().length();
-
-        void *d_input;
-        CUDA_CHECK(cudaMalloc(&d_input, input_memsize));
-
-        void *d_output;
-        unsigned int output_memsize = -1;
-        switch(taskType) {
-        case cufftType::CUFFT_C2C:
-        case cufftType::CUFFT_Z2Z:
-            output_memsize = input_memsize;
-            break;
-        case cufftType::CUFFT_R2C:
-        case cufftType::CUFFT_D2Z:
-            output_memsize = input_memsize*2;
-            break;
-        case cufftType::CUFFT_C2R:
-        case cufftType::CUFFT_Z2D:
-            output_memsize = input_memsize/2;
-            break;
-        default:
-            assert(false); // should never happen
-        }
-        CUDA_CHECK(cudaMalloc(&d_output, output_memsize));
 
         int dims = request->size_size();
         int *sizes = (int *)malloc(dims * sizeof(int));
@@ -118,21 +215,33 @@ public:
             }
         }
 
+        if (!validate_input(batch_size, dims, sizes, task_type, direction, input_memsize)) {
+            return ::grpc::Status::CANCELLED;
+        }
+
+        void *d_input;
+        CUDA_CHECK(cudaMalloc(&d_input, input_memsize));
+        CUDA_CHECK(cudaMemcpy(d_input, input, input_memsize, cudaMemcpyHostToDevice));
+
+        void *d_output;
+        const unsigned int output_memsize = calc_output_memsize(batch_size, dims, sizes, task_type);
+        CUDA_CHECK(cudaMalloc(&d_output, output_memsize));
+
         cufftHandle plan;
         CUFFT_CHECK(cufftPlanMany(
                         &plan, dims, sizes,
                         NULL, 0, 0,
                         NULL, 0, 0,
-                        taskType,
+                        task_type,
                         batch_size
                     ));
 
-        switch(taskType) {
+        switch(task_type) {
         case cufftType::CUFFT_C2C:
-            cufftExecC2C(plan, (cufftComplex *)d_input, (cufftComplex *)d_output, ft_direction(request->type()));
+            cufftExecC2C(plan, (cufftComplex *)d_input, (cufftComplex *)d_output, direction);
             break;
         case cufftType::CUFFT_Z2Z:
-            cufftExecZ2Z(plan, (cufftDoubleComplex *)d_input, (cufftDoubleComplex *)d_output, ft_direction(request->type()));
+            cufftExecZ2Z(plan, (cufftDoubleComplex *)d_input, (cufftDoubleComplex *)d_output, direction);
             break;
         case cufftType::CUFFT_R2C:
             cufftExecR2C(plan, (cufftReal *)d_input, (cufftComplex *)d_output);
@@ -172,7 +281,7 @@ int main(int argc, char **argv) {
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     std::unique_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "Server listening on " << server_address << std::endl;
+    LOG(INFO) << "Server listening on " << server_address;
     server->Wait();
     return 0;
 }
