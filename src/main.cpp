@@ -258,9 +258,11 @@ public:
         default:
             assert(false); // should never happen
         }
+        cudaDeviceSynchronize();
 
         void *output = (void *)malloc(output_memsize);
         CUDA_CHECK(cudaMemcpy(output, d_output, output_memsize, cudaMemcpyDeviceToHost));
+        cufftDestroy(plan);
         CUDA_CHECK(cudaFree(d_input));
         if (d_output != d_input) {
             CUDA_CHECK(cudaFree(d_output));
