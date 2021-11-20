@@ -269,6 +269,7 @@ public:
         }
 
         std::string *output_string = new std::string((char *)output, output_memsize);
+        free(output); // TODO: remove intermediate "output"
         response->set_allocated_values(output_string);
         return ::grpc::Status::OK;
     };
@@ -285,5 +286,6 @@ int main(int argc, char **argv) {
     std::unique_ptr<Server> server(builder.BuildAndStart());
     LOG(INFO) << "Server listening on " << server_address;
     server->Wait();
+    cudaDeviceReset();
     return 0;
 }
